@@ -16,11 +16,11 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 # ------------------------------------------------------------
-# Furious - Discord music bot
+# Furious - Discord music bot (Railway + local compatible)
 # - Slash commands (/play) and mention-prefix commands (@Furious play)
 # - Ping the bot (just @Furious) -> stats embed + Trust button
 # - 24/7 mode, rotating status, trusted counter
-# - YouTube cookies fix + SoundCloud fallback
+# - YouTube cookies (file / env / browser) + SoundCloud fallback
 # ------------------------------------------------------------
 
 load_dotenv()
@@ -31,14 +31,28 @@ DEV_NAME = "shubh"
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-TRUSTED_FILE = BASE_DIR / "trusted.json"
+
+# ---- Persistent data (Railway Volume mounted at /data) ----
+_data_env = os.getenv("DATA_DIR")
+if _data_env:
+    DATA_DIR = Path(_data_env)
+elif Path("/data").exists():
+    DATA_DIR = Path("/data")
+else:
+    DATA_DIR = BASE_DIR
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+TRUSTED_FILE = DATA_DIR / "trusted.json"
 
 # ---- YouTube cookies ----
-# Option 1: put a cookies.txt file next to this script (used first if it exists)
-# Option 2: read cookies from a browser. Set COOKIE_BROWSER in .env
-#           (firefox, chrome, edge, brave, opera, vivaldi) or "none" to disable.
+# Priority: 1) COOKIES_TXT env variable (Railway)  2) cookies.txt file  3) browser
 COOKIES_FILE = BASE_DIR / "cookies.txt"
-COOKIE_BROWSER = os.getenv("COOKIE_BROWSER", "firefox").strip().lower()
+_cookies_env = os.getenv("COOKIES_TXT")
+if _cookies_env:
+    COOKIES_FILE.write_text(_cookies_env.strip() + "\n", encoding="utf-8")
+
+ON_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID"))
+# On a server there is no browser, so default to "none". Locally default to firefox.
+COOKIE_BROWSER = os.getenv("COOKIE_BROWSER", "none" if ON_RAILWAY else "firefox").strip().lower()
 
 FFMPEG_PATH = shutil.which("ffmpeg")
 MAX_DURATION = 20 * 60
@@ -157,9 +171,12 @@ def startup_check() -> None:
     log.info("discord.py: %s", discord.__version__)
     log.info("yt-dlp: %s", yt_dlp.version.__version__)
     log.info("Python: %s", sys.version.split()[0])
+    log.info("Running on Railway: %s", ON_RAILWAY)
     log.info("FFmpeg: %s", FFMPEG_PATH or "NOT FOUND")
     log.info("Opus loaded: %s (not required for FFmpegOpusAudio)", discord.opus.is_loaded())
     log.info("Deno: %s", shutil.which("deno") or "not found")
+    log.info("Data dir: %s", DATA_DIR)
+    log.info("Trusted users loaded: %s", len(trusted_users))
     if COOKIES_FILE.exists():
         log.info("Cookies: using cookies.txt")
     elif COOKIE_BROWSER and COOKIE_BROWSER != "none":
@@ -200,10 +217,7 @@ def _extract_sync(query: str) -> dict | None:
     is_url = query.startswith(("http://", "https://"))
 
     # 1) YouTube with cookies -> 2) YouTube without cookies -> 3) SoundCloud
-    attempts = [
-        (query, True),
-        (query, False),
-    ]
+    attempts = [(query, True), (query, False)]
     if not is_url:
         attempts.append((f"scsearch1:{query}", False))
 
@@ -260,9 +274,9 @@ def _download_target(target: str, guild_id: int, use_cookies: bool) -> str:
 
 def _download_sync(webpage: str, title: str, guild_id: int) -> str:
     attempts = [
-        (webpage, True),                      # YouTube + cookies
-        (webpage, False),                     # YouTube, no cookies
-        (f"scsearch1:{title}", False),        # SoundCloud fallback
+        (webpage, True),                 # YouTube + cookies
+        (webpage, False),                # YouTube, no cookies
+        (f"scsearch1:{title}", False),   # SoundCloud fallback
     ]
     last_error: Exception | None = None
     for target, use_cookies in attempts:
@@ -1106,10 +1120,10 @@ async def help_cmd(ctx: commands.Context):
 
 if __name__ == "__main__":
     if not TOKEN:
-        raise RuntimeError("DISCORD_TOKEN is missing. Set it in your local .env file.")
+        raise RuntimeError("DISCORD_TOKEN is missing. Set it in your .env file or Railway Variables.")
     if not FFMPEG_PATH:
-        raise RuntimeError("FFmpeg was not found. Install FFmpeg and add it to PATH.")
+        raise RuntimeError("FFmpeg was not found. Install FFmpeg or deploy with the Dockerfile.")
 
     startup_check()
     clean_downloads()
-    bot.run(TOKEN)  
+    bot.run(TOKEN)    
