@@ -1,0 +1,8 @@
+.env
+cookies.txt
+cookies.txt.txt
+downloads/
+trusted.json
+test.webm
+__pycache__/
+*.pyc
