@@ -15,6 +15,22 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
+
+print("Python:", sys.executable)
+print("Python version:", sys.version)
+print("Working directory:", os.getcwd())
+
+ffmpeg = shutil.which("ffmpeg")
+print("FFmpeg:", ffmpeg)
+
+if ffmpeg:
+    result = subprocess.run(
+        [ffmpeg, "-version"],
+        capture_output=True,
+        text=True
+    )
+    print("FFmpeg version:", result.stdout.splitlines()[0])
+
 # ------------------------------------------------------------
 # Furious - Discord music bot (Railway + local compatible)
 # - Slash commands (/play) and mention-prefix commands (@Furious play)
