@@ -4,9 +4,12 @@ import json
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
+from functools import wraps
 from importlib import metadata
 from pathlib import Path
 
@@ -52,6 +55,8 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 # Set VOICE_DEBUG=1 in Railway Variables to enable verbose voice diagnostics.
 VOICE_DEBUG = os.getenv("VOICE_DEBUG", "0").strip().lower() in ("1", "true", "yes")
+# Set VOICE_PACKET_DEBUG=1 for once-per-second packet-path diagnostics (temporary).
+VOICE_PACKET_DEBUG = os.getenv("VOICE_PACKET_DEBUG", "0").strip().lower() in ("1", "true", "yes")
 
 # ---- Persistent data (Railway Volume mounted at /data) ----
 _data_env = os.getenv("DATA_DIR")
@@ -219,6 +224,7 @@ def startup_check() -> None:
     log.info("PyNaCl: %s", package_version("PyNaCl"))
     log.info("davey (voice E2EE): %s", package_version("davey"))
     log.info("VOICE_DEBUG: %s", VOICE_DEBUG)
+    log.info("VOICE_PACKET_DEBUG: %s", VOICE_PACKET_DEBUG)
     log.info("Deno: %s", shutil.which("deno") or "not found")
     log.info("Data dir: %s", DATA_DIR)
     log.info("Trusted users loaded: %s", len(trusted_users))
@@ -393,6 +399,293 @@ async def voice_watchdog(player: "MusicPlayer", finished: asyncio.Event) -> None
         raise
     except Exception:
         log.exception("Voice watchdog crashed.")
+
+
+# ------------------------------------------------------------
+# TEMPORARY packet-path diagnostics (VOICE_PACKET_DEBUG=1)
+#
+# Observation only. Every wrapper calls the ORIGINAL discord.py function with
+# the same arguments, returns its result unchanged and re-raises anything it
+# raises. Nothing here touches encryption, networking or playback behaviour.
+# Never logged: bot token, secret key, nonces, packet contents.
+#
+# Stages (one log tag each, ~once per second while a track plays):
+#   PKT/SRC  FFmpeg + libopus : Opus frames read from FFmpeg   (AudioSource.read)
+#   PKT/ENC  Python encode    : VoiceClient.send_audio_packet (encode flag)
+#            DAVE E2EE        : VoiceClient._get_voice_packet (dave on/off)
+#            RTP + transport  : VoiceClient._get_voice_packet (size in -> out)
+#   PKT/UDP  UDP transmission : VoiceConnectionState.send_packet (socket.sendall)
+# ------------------------------------------------------------
+_PKT_INTERVAL = 1.0  # seconds between summary lines
+_PKT_TRACEBACK_INTERVAL = 1.0  # at most one full traceback per second per stage
+
+
+class _PacketStats:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.window_start = time.monotonic()
+        self.last_traceback = 0.0
+        self.socket_logged = False
+        self.total_udp_ok = 0
+        self.total_udp_err = 0
+        self.reset_window()
+
+    def reset_window(self):
+        self.window_start = time.monotonic()
+        self.audio_calls = 0
+        self.py_encode_calls = 0       # send_audio_packet(encode=True) -> Python-side Opus encode
+        self.audio_in_bytes = 0
+        self.built = 0                 # _get_voice_packet returned
+        self.build_errors = 0
+        self.dave_on = 0               # packet passed through DAVE encrypt_opus
+        self.dave_expected_not_ready = 0  # DAVE negotiated but session not ready -> NOT DAVE-encrypted
+        self.dave_off = 0              # DAVE not in use for this packet
+        self.build_in_bytes = 0
+        self.build_out_bytes = 0
+        self.udp_ok = 0
+        self.udp_err = 0
+        self.udp_bytes = 0
+        self.udp_min = None
+        self.udp_max = 0
+        self.udp_slowest = 0.0
+        self.udp_err_types = {}
+
+
+def _pkt_stats(vc) -> _PacketStats:
+    stats = vc.__dict__.get("_furious_pkt_stats")
+    if stats is None:
+        stats = _PacketStats()
+        vc.__dict__["_furious_pkt_stats"] = stats
+    return stats
+
+
+def _pkt_log_exception(stats: _PacketStats, where: str, vc, exc: BaseException) -> None:
+    """Full traceback, rate limited to one per second per client."""
+    now = time.monotonic()
+    with stats.lock:
+        if now - stats.last_traceback < _PKT_TRACEBACK_INTERVAL:
+            return
+        stats.last_traceback = now
+    log.error(
+        "[%s] PKT exception in %s: %s: %s",
+        vc.guild.id, where, type(exc).__name__, exc,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+
+
+def _pkt_log_socket_once(stats: _PacketStats, vc, conn) -> None:
+    if stats.socket_logged:
+        return
+    stats.socket_logged = True
+    sock = conn.socket
+    try:
+        peer = sock.getpeername()
+    except OSError as exc:
+        peer = f"NOT CONNECTED ({exc!r})"
+    log.info(
+        "[%s] PKT/SOCK local=%s peer=%s type=%s blocking=%s sndbuf=%s "
+        "(IP addresses only, no credentials)",
+        vc.guild.id, sock.getsockname(), peer, sock.type.name, sock.getblocking(),
+        sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF),
+    )
+
+
+def _pkt_flush(vc, conn, stats: _PacketStats) -> None:
+    now = time.monotonic()
+    if now - stats.window_start < _PKT_INTERVAL:
+        return
+    with stats.lock:
+        span = now - stats.window_start
+        snap = dict(stats.__dict__)
+        stats.total_udp_ok += stats.udp_ok
+        stats.total_udp_err += stats.udp_err
+        total_ok, total_err = stats.total_udp_ok, stats.total_udp_err
+        stats.reset_window()
+
+    _pkt_log_socket_once(stats, vc, conn)
+
+    session = conn.dave_session
+    dave_state = (
+        f"protocol={conn.dave_protocol_version} "
+        f"session={'yes' if session is not None else 'no'} "
+        f"ready={session.ready if session is not None else None} "
+        f"can_encrypt={conn.can_encrypt} downgraded={conn.dave_downgraded}"
+    )
+    avg = lambda total, n: (total // n) if n else 0
+
+    log.info(
+        "[%s] PKT/ENC %.1fs | send_audio_packet calls=%d python_opus_encode=%d (0 expected for FFmpegOpusAudio) "
+        "| packets_built=%d build_errors=%d | opus_in avg=%dB | rtp_out avg=%dB "
+        "| DAVE encrypted=%d not_ready=%d off=%d | %s | mode=%s ssrc=%s seq=%s ts=%s",
+        vc.guild.id, span, snap["audio_calls"], snap["py_encode_calls"],
+        snap["built"], snap["build_errors"],
+        avg(snap["build_in_bytes"], snap["built"]), avg(snap["build_out_bytes"], snap["built"]),
+        snap["dave_on"], snap["dave_expected_not_ready"], snap["dave_off"],
+        dave_state, vc.mode, vc.ssrc, vc.sequence, vc.timestamp,
+    )
+    log.info(
+        "[%s] PKT/UDP %.1fs | sent_ok=%d send_errors=%d %s | bytes=%d size min/avg/max=%s/%d/%dB "
+        "| slowest_send=%.2fms | totals ok=%d err=%d | connected=%s playing=%s paused=%s",
+        vc.guild.id, span, snap["udp_ok"], snap["udp_err"], snap["udp_err_types"] or "",
+        snap["udp_bytes"], snap["udp_min"], avg(snap["udp_bytes"], snap["udp_ok"]), snap["udp_max"],
+        snap["udp_slowest"] * 1000, total_ok, total_err,
+        vc.is_connected(), vc.is_playing(), vc.is_paused(),
+    )
+    if snap["udp_err"]:
+        log.warning(
+            "[%s] PKT/UDP %d send error(s) this second. discord.py swallows OSError in "
+            "send_audio_packet (DEBUG log only), so these packets were DROPPED silently.",
+            vc.guild.id, snap["udp_err"],
+        )
+    if snap["dave_expected_not_ready"]:
+        log.warning(
+            "[%s] PKT/ENC DAVE was negotiated but the session was not ready for %d packet(s): "
+            "they were sent WITHOUT DAVE encryption.",
+            vc.guild.id, snap["dave_expected_not_ready"],
+        )
+
+
+def _wrap_send_audio_packet(original):
+    @wraps(original)
+    def wrapper(self, data, *, encode=True):
+        stats = _pkt_stats(self)
+        with stats.lock:
+            stats.audio_calls += 1
+            stats.audio_in_bytes += len(data)
+            if encode:
+                stats.py_encode_calls += 1
+        try:
+            return original(self, data, encode=encode)
+        except Exception as exc:
+            _pkt_log_exception(stats, "send_audio_packet", self, exc)
+            raise
+    return wrapper
+
+
+def _wrap_get_voice_packet(original):
+    @wraps(original)
+    def wrapper(self, data):
+        stats = _pkt_stats(self)
+        conn = self._connection
+        dave_on = bool(conn.dave_session and conn.can_encrypt)
+        dave_expected = conn.dave_protocol_version != 0
+        try:
+            packet = original(self, data)
+        except Exception as exc:
+            with stats.lock:
+                stats.build_errors += 1
+            _pkt_log_exception(stats, "_get_voice_packet (DAVE/RTP/transport encrypt)", self, exc)
+            raise
+        with stats.lock:
+            stats.built += 1
+            stats.build_in_bytes += len(data)
+            stats.build_out_bytes += len(packet)
+            if dave_on:
+                stats.dave_on += 1
+            elif dave_expected:
+                stats.dave_expected_not_ready += 1
+            else:
+                stats.dave_off += 1
+        return packet
+    return wrapper
+
+
+def _wrap_send_packet(original):
+    @wraps(original)
+    def wrapper(self, packet):
+        vc = self.voice_client
+        stats = _pkt_stats(vc)
+        started = time.perf_counter()
+        try:
+            result = original(self, packet)
+        except Exception as exc:
+            elapsed = time.perf_counter() - started
+            with stats.lock:
+                stats.udp_err += 1
+                stats.udp_slowest = max(stats.udp_slowest, elapsed)
+                name = type(exc).__name__
+                stats.udp_err_types[name] = stats.udp_err_types.get(name, 0) + 1
+            _pkt_log_exception(stats, "UDP socket.sendall", vc, exc)
+            raise  # unchanged behaviour: discord.py decides what to do with it
+        else:
+            elapsed = time.perf_counter() - started
+            size = len(packet)
+            with stats.lock:
+                stats.udp_ok += 1
+                stats.udp_bytes += size
+                stats.udp_max = max(stats.udp_max, size)
+                stats.udp_min = size if stats.udp_min is None else min(stats.udp_min, size)
+                stats.udp_slowest = max(stats.udp_slowest, elapsed)
+            return result
+        finally:
+            try:
+                _pkt_flush(vc, self, stats)
+            except Exception:
+                log.exception("Packet diagnostics flush failed (diagnostics only, playback unaffected).")
+    return wrapper
+
+
+def install_voice_packet_diagnostics() -> None:
+    from discord import voice_client as _vc_mod
+    from discord import voice_state as _vs_mod
+
+    targets = [
+        (_vc_mod.VoiceClient, "send_audio_packet", _wrap_send_audio_packet),
+        (_vc_mod.VoiceClient, "_get_voice_packet", _wrap_get_voice_packet),
+        (_vs_mod.VoiceConnectionState, "send_packet", _wrap_send_packet),
+    ]
+    for cls, name, make_wrapper in targets:
+        original = getattr(cls, name, None)
+        if original is None:
+            log.error("Packet diagnostics: %s.%s not found, that stage will NOT be measured.", cls.__name__, name)
+            continue
+        if getattr(original, "_furious_diag", False):
+            continue
+        wrapped = make_wrapper(original)
+        wrapped._furious_diag = True
+        setattr(cls, name, wrapped)
+        log.info("Packet diagnostics installed on %s.%s", cls.__name__, name)
+
+
+class DiagFFmpegOpusAudio(discord.FFmpegOpusAudio):
+    """FFmpegOpusAudio that counts the Opus frames FFmpeg hands to discord.py (PKT/SRC)."""
+
+    def __init__(self, *args, diag_tag: str = "", **kwargs):
+        self._diag_tag = diag_tag
+        self._diag_window = time.monotonic()
+        self._diag_started = self._diag_window
+        self._diag_frames = 0
+        self._diag_bytes = 0
+        self._diag_total = 0
+        self._diag_slowest = 0.0
+        super().__init__(*args, **kwargs)
+
+    def read(self) -> bytes:
+        started = time.perf_counter()
+        data = super().read()  # may raise if FFmpeg failed: left untouched
+        elapsed = time.perf_counter() - started
+        now = time.monotonic()
+        if not data:
+            log.info(
+                "[%s] PKT/SRC FFmpeg source ended | total_frames=%d (~%.1fs of audio) | wall=%.1fs",
+                self._diag_tag, self._diag_total, self._diag_total * 0.02, now - self._diag_started,
+            )
+            return data
+        self._diag_frames += 1
+        self._diag_total += 1
+        self._diag_bytes += len(data)
+        self._diag_slowest = max(self._diag_slowest, elapsed)
+        if now - self._diag_window >= _PKT_INTERVAL:
+            log.info(
+                "[%s] PKT/SRC %.1fs | opus_frames=%d (50 expected) avg=%dB | slowest_read=%.2fms | total=%d",
+                self._diag_tag, now - self._diag_window, self._diag_frames,
+                self._diag_bytes // self._diag_frames, self._diag_slowest * 1000, self._diag_total,
+            )
+            self._diag_window = now
+            self._diag_frames = 0
+            self._diag_bytes = 0
+            self._diag_slowest = 0.0
+        return data
 
 
 # ------------------------------------------------------------
@@ -630,11 +923,19 @@ class MusicPlayer:
                 if not FFMPEG_PATH:
                     raise RuntimeError("FFmpeg is not installed or is not on PATH.")
 
-                source = discord.FFmpegOpusAudio(
-                    song["path"],
-                    executable=FFMPEG_PATH,
-                    options=f'-vn -af "volume={self.volume}" -loglevel warning',
-                )
+                if VOICE_PACKET_DEBUG:
+                    source = DiagFFmpegOpusAudio(
+                        song["path"],
+                        executable=FFMPEG_PATH,
+                        options=f'-vn -af "volume={self.volume}" -loglevel warning',
+                        diag_tag=str(self.guild_id),
+                    )
+                else:
+                    source = discord.FFmpegOpusAudio(
+                        song["path"],
+                        executable=FFMPEG_PATH,
+                        options=f'-vn -af "volume={self.volume}" -loglevel warning',
+                    )
 
                 finished = asyncio.Event()
                 started_at = time.monotonic()
@@ -1271,12 +1572,15 @@ async def voicetest_cmd(ctx: commands.Context):
         log.info("[%s] voicetest after() fired, error=%r", ctx.guild.id, error)
         loop.call_soon_threadsafe(done.set)
 
-    source = discord.FFmpegOpusAudio(
-        "sine=frequency=440:duration=6",
+    source_args = dict(
         executable=FFMPEG_PATH,
         before_options="-f lavfi",
         options="-af volume=2 -loglevel warning",
     )
+    if VOICE_PACKET_DEBUG:
+        source = DiagFFmpegOpusAudio("sine=frequency=440:duration=6", diag_tag=str(ctx.guild.id), **source_args)
+    else:
+        source = discord.FFmpegOpusAudio("sine=frequency=440:duration=6", **source_args)
     voice.play(source, after=after)
     log.info("[%s] voicetest play() | %s", ctx.guild.id, voice_snapshot(voice))
     await ctx.send("🔊 Playing a 6-second 440 Hz tone. Do you hear it?")
@@ -1291,5 +1595,7 @@ if __name__ == "__main__":
         raise RuntimeError("FFmpeg was not found. Install FFmpeg or deploy with the Dockerfile.")
 
     startup_check()
+    if VOICE_PACKET_DEBUG:
+        install_voice_packet_diagnostics()
     clean_downloads()
-    bot.run(TOKEN)    
+    bot.run(TOKEN)
