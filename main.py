@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
+from importlib import metadata
 from pathlib import Path
 
 import discord
@@ -37,6 +38,7 @@ if ffmpeg:
 # - Ping the bot (just @Furious) -> stats embed + Trust button
 # - 24/7 mode, rotating status, trusted counter
 # - YouTube cookies (file / env / browser) + SoundCloud fallback
+# - VOICE_DEBUG=1 -> verbose voice diagnostics + @Furious voicetest
 # ------------------------------------------------------------
 
 load_dotenv()
@@ -47,6 +49,9 @@ DEV_NAME = "shubh"
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+# Set VOICE_DEBUG=1 in Railway Variables to enable verbose voice diagnostics.
+VOICE_DEBUG = os.getenv("VOICE_DEBUG", "0").strip().lower() in ("1", "true", "yes")
 
 # ---- Persistent data (Railway Volume mounted at /data) ----
 _data_env = os.getenv("DATA_DIR")
@@ -92,6 +97,27 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("Furious")
+
+
+class _DropGatewayEventSpam(logging.Filter):
+    """Best-effort: hide the per-event gateway spam when debug logging is on."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "WebSocket Event" not in record.getMessage()
+
+
+if VOICE_DEBUG:
+    for _name in ("discord.voice_client", "discord.voice_state", "discord.player", "discord.gateway"):
+        logging.getLogger(_name).setLevel(logging.DEBUG)
+    logging.getLogger("discord.gateway").addFilter(_DropGatewayEventSpam())
+
+
+def package_version(name: str) -> str:
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return "NOT INSTALLED"
+
 
 players: dict[int, "MusicPlayer"] = {}
 
@@ -190,6 +216,9 @@ def startup_check() -> None:
     log.info("Running on Railway: %s", ON_RAILWAY)
     log.info("FFmpeg: %s", FFMPEG_PATH or "NOT FOUND")
     log.info("Opus loaded: %s (not required for FFmpegOpusAudio)", discord.opus.is_loaded())
+    log.info("PyNaCl: %s", package_version("PyNaCl"))
+    log.info("davey (voice E2EE): %s", package_version("davey"))
+    log.info("VOICE_DEBUG: %s", VOICE_DEBUG)
     log.info("Deno: %s", shutil.which("deno") or "not found")
     log.info("Data dir: %s", DATA_DIR)
     log.info("Trusted users loaded: %s", len(trusted_users))
@@ -331,6 +360,39 @@ def remove_song_file(song: dict | None) -> None:
 def volume_bar(volume: float, size: int = 10) -> str:
     filled = max(0, min(size, round(volume * size)))
     return "▰" * filled + "▱" * (size - filled)
+
+
+# ------------------------------------------------------------
+# Voice diagnostics
+# ------------------------------------------------------------
+def voice_snapshot(voice: discord.VoiceClient | None) -> str:
+    if voice is None:
+        return "voice=None"
+    channel = voice.channel
+    perms = ""
+    if channel is not None:
+        p = channel.permissions_for(voice.guild.me)
+        perms = f" can_connect={p.connect} can_speak={p.speak}"
+    return (
+        f"connected={voice.is_connected()} playing={voice.is_playing()} "
+        f"paused={voice.is_paused()} channel={channel.name if channel else None} "
+        f"ws_latency={voice.latency:.3f}s avg_ws_latency={voice.average_latency:.3f}s{perms}"
+    )
+
+
+async def voice_watchdog(player: "MusicPlayer", finished: asyncio.Event) -> None:
+    """Logs the voice state every 5s while a track is playing (VOICE_DEBUG only)."""
+    try:
+        while True:
+            try:
+                await asyncio.wait_for(finished.wait(), timeout=5)
+                return
+            except asyncio.TimeoutError:
+                log.info("[%s] voice check | %s", player.guild_id, voice_snapshot(player.voice))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Voice watchdog crashed.")
 
 
 # ------------------------------------------------------------
@@ -542,6 +604,10 @@ class MusicPlayer:
                 self.skipped = False
 
             if not self.voice or not self.voice.is_connected():
+                log.warning(
+                    "[%s] Voice not connected when about to play. %s",
+                    self.guild_id, voice_snapshot(self.voice),
+                )
                 remove_song_file(song)
                 self.current = None
                 self.status = "Idle"
@@ -559,6 +625,7 @@ class MusicPlayer:
                 self.current = None
                 continue
 
+            watchdog: asyncio.Task | None = None
             try:
                 if not FFMPEG_PATH:
                     raise RuntimeError("FFmpeg is not installed or is not on PATH.")
@@ -573,20 +640,18 @@ class MusicPlayer:
                 started_at = time.monotonic()
 
                 def after(error):
+                    # Runs in the player thread.
+                    log.info("[%s] after() fired, error=%r", self.guild_id, error)
                     if error:
                         log.error("Voice playback error: %s", error)
                     event_loop.call_soon_threadsafe(finished.set)
 
-               self.voice.play(source, after=after)
+                self.voice.play(source, after=after)
+                self.status = "Playing"
+                log.info("[%s] play() called | %s", self.guild_id, voice_snapshot(self.voice))
 
-log.info(
-    "[%s] VOICE DEBUG | connected=%s | playing=%s",
-    self.guild_id,
-    self.voice.is_connected(),
-    self.voice.is_playing(),
-)
-
-self.status = "Playing"
+                if VOICE_DEBUG:
+                    watchdog = asyncio.create_task(voice_watchdog(self, finished))
 
                 # New track -> brand new embed. A loop repeat just refreshes the panel.
                 if repeat and self.panel_message:
@@ -594,15 +659,30 @@ self.status = "Playing"
                 else:
                     await self.publish_panel()
 
+                await asyncio.sleep(1.5)
+                log.info(
+                    "[%s] +1.5s after play() | %s | finished=%s",
+                    self.guild_id, voice_snapshot(self.voice), finished.is_set(),
+                )
+
                 log.info("[%s] Playing %s", self.guild_id, song["title"])
                 await finished.wait()
 
                 elapsed = time.monotonic() - started_at
-                log.info("[%s] Track ended after %.1fs", self.guild_id, elapsed)
+                expected = song.get("duration")
+                log.info(
+                    "[%s] Track ended after %.1fs (expected %s) | skipped=%s | %s",
+                    self.guild_id, elapsed, expected, self.skipped, voice_snapshot(self.voice),
+                )
+                if expected and not self.skipped and elapsed < expected - 5:
+                    log.warning("[%s] Track ended EARLY (%.1fs of %ss).", self.guild_id, elapsed, expected)
 
             except Exception as error:
                 log.exception("Playback failed.")
                 await self.send(f"{EMOJI_ERROR} Couldn't play **{song['title']}**: `{str(error)[:250]}`")
+            finally:
+                if watchdog and not watchdog.done():
+                    watchdog.cancel()
 
             was_skipped = self.skipped
             if not self.loop or was_skipped:
@@ -830,12 +910,28 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 
 @bot.event
 async def on_voice_state_update(member, before, after):
+    # Log every state change of the bot itself (server mute/deafen/suppress, moves, drops).
+    if bot.user and member.id == bot.user.id:
+        log.info(
+            "[%s] Bot voice state | %s -> %s | server_mute=%s server_deaf=%s "
+            "self_mute=%s self_deaf=%s suppress=%s",
+            member.guild.id,
+            before.channel.name if before.channel else None,
+            after.channel.name if after.channel else None,
+            after.mute, after.deaf, after.self_mute, after.self_deaf, after.suppress,
+        )
+
     if not (bot.user and member.id == bot.user.id and before.channel and not after.channel):
         return
 
     player = players.get(member.guild.id)
     if not player:
         return
+
+    log.warning(
+        "[%s] Bot left voice (idle leave, kick, or dropped connection). %s",
+        member.guild.id, voice_snapshot(player.voice),
+    )
 
     player.queue.clear()
     remove_song_file(player.current)
@@ -1140,6 +1236,52 @@ async def help_cmd(ctx: commands.Context):
     )
     embed.set_footer(text=f"FURIOUS AUDIO  •  Developed by {DEV_NAME}")
     await ctx.send(embed=embed, ephemeral=True)
+
+
+# ------------------------------------------------------------
+# Voice isolation test (prefix-only, owner-only, needs VOICE_DEBUG=1)
+# Plays a generated 440 Hz tone: no yt-dlp, no downloaded files.
+# ------------------------------------------------------------
+@bot.command(name="voicetest")
+@commands.guild_only()
+@commands.is_owner()
+async def voicetest_cmd(ctx: commands.Context):
+    if not VOICE_DEBUG:
+        return await ctx.send("Set VOICE_DEBUG=1 to use this.")
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        return await ctx.send(f"{EMOJI_ERROR} Join a voice channel first.")
+
+    player = get_player(ctx.guild.id)
+    if player.is_active() or player.current or player.queue:
+        return await ctx.send(f"{EMOJI_ERROR} Stop the player first.")
+
+    channel = ctx.author.voice.channel
+    voice = ctx.guild.voice_client
+    if voice is None:
+        voice = await channel.connect()
+    elif voice.channel != channel:
+        await voice.move_to(channel)
+    player.voice = voice
+    player.text_channel = ctx.channel
+
+    loop = asyncio.get_running_loop()
+    done = asyncio.Event()
+
+    def after(error):
+        log.info("[%s] voicetest after() fired, error=%r", ctx.guild.id, error)
+        loop.call_soon_threadsafe(done.set)
+
+    source = discord.FFmpegOpusAudio(
+        "sine=frequency=440:duration=6",
+        executable=FFMPEG_PATH,
+        before_options="-f lavfi",
+        options="-af volume=2 -loglevel warning",
+    )
+    voice.play(source, after=after)
+    log.info("[%s] voicetest play() | %s", ctx.guild.id, voice_snapshot(voice))
+    await ctx.send("🔊 Playing a 6-second 440 Hz tone. Do you hear it?")
+    await done.wait()
+    log.info("[%s] voicetest finished | %s", ctx.guild.id, voice_snapshot(voice))
 
 
 if __name__ == "__main__":
