@@ -577,8 +577,16 @@ class MusicPlayer:
                         log.error("Voice playback error: %s", error)
                     event_loop.call_soon_threadsafe(finished.set)
 
-                self.voice.play(source, after=after)
-                self.status = "Playing"
+               self.voice.play(source, after=after)
+
+log.info(
+    "[%s] VOICE DEBUG | connected=%s | playing=%s",
+    self.guild_id,
+    self.voice.is_connected(),
+    self.voice.is_playing(),
+)
+
+self.status = "Playing"
 
                 # New track -> brand new embed. A loop repeat just refreshes the panel.
                 if repeat and self.panel_message:
